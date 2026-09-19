@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Movement Sandbox</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1d24; font-family: sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; color: #eef; font-size: 13px;
+    line-height: 1.5; text-shadow: 0 1px 2px black; user-select: none; pointer-events: none;
+  }
+  #hud b { color: #ffd479; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// Movement stats — see movement-sandbox-design.md for the feel targets these
+// are meant to hit. These are first-pass numbers to tune by feel, not final.
+// ---------------------------------------------------------------------------
+// Tuned toward Melee Fox's ratios (twitchy ground game, tighter relative air
+// control, heavier/snappier fall, a double jump that goes HIGHER than the
+// first jump). Exact numbers don't port across unit systems, so these are
+// our own values scaled by Fox's ratios, not literal conversions.
+const STATS = {
+  groundMaxSpeed: 14,
+  groundAccel: 240,
+  groundDecel: 110,
+  gravity: 72,       // was 45; heavier/faster fall onset, Fox-like
+  maxFallSpeed: 28,   // was 22
+  jumpSpeed: 25.3,    // was 20; recalculated so jump HEIGHT is unchanged
+                       // despite the higher gravity (shorter hang time instead)
+  doubleJumpSpeed: 28.7, // was 20 (equal to jumpSpeed); now ~28% taller than
+                          // the first jump, matching Fox's double jump being
+                          // bigger than his own single jump
+  airAccel: 36,
+  // Air friction: a separate, weaker deceleration that only applies when no
+  // direction is held in the air (Melee has this; we were missing it
+  // entirely, which is why letting go mid-air did nothing). Scaled to ~25%
+  // of Air Acceleration, matching Fox's real friction/accel ratio.
+  airFriction: 6,
+  maxAirSpeed: 8,     // was 5.3; Fox's air speed is only ~38% of his run
+                      // speed (tighter than the 50% we had), not floatier
+};
+
+// Purely cosmetic — doesn't feed back into physics/rollback state.
+const ANIM = {
+  legSwingMax: 0.9,          // radians, full leg swing amplitude at max ground speed
+  gaitCyclesPerSecAtMax: 2.2,// full stride cycles per second at max ground speed
+  legEaseRate: Math.PI * 10, // radians/sec, how fast a leg eases toward its target angle
+  jumpPoseAngle: 0.35,       // radians, both legs tuck to this angle while airborne
+};
+
+// Strict 2D movement plane: only X (left/right) and Y (jumping) are
+// simulated. STAGE_DEPTH is purely cosmetic, for rendering a stage with
+// some visual thickness instead of a flat line.
+const STAGE = { halfX: 11 };
+const STAGE_DEPTH = 6.4;
+const PLAYER_RADIUS = 0.4;
+
+// Fixed timestep: physics always advances in 1/60s chunks regardless of
+// render framerate, so the simulation stays deterministic — required to
+// keep rollback netcode possible later even though v1 has no networking.
+const FIXED_DT = 1 / 60;
+
+// --- renderer / scene -------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 7, 17);
+camera.lookAt(0, 2.5, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(6, 12, 8);
+scene.add(sun);
+
+// --- stage -------------------------------------------------------------------
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(STAGE.halfX * 2 + 4, STAGE_DEPTH),
+  new THREE.MeshStandardMaterial({ color: 0x3c9d4f })
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(STAGE.halfX * 2, 22, 0x1f5c2b, 0x2f7a3c);
+grid.position.y = 0.01;
+scene.add(grid);
+
+// --- placeholder humanoid character ------------------------------------------
+function buildCharacter() {
+  const group = new THREE.Group();
+
+  const hipHeight = 0.85;
+  const legRadius = 0.12;
+
+  // Each leg is a pivot Group hinged at the hip; rotating it around Z swings
+  // the leg forward/back in the character's local X-Y (facing) plane.
+  function buildLeg(sideX) {
+    const pivot = new THREE.Group();
+    pivot.position.set(sideX, hipHeight, 0);
+    const leg = new THREE.Mesh(
+      new THREE.CapsuleGeometry(legRadius, hipHeight - legRadius * 2, 4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x24418f })
+    );
+    leg.position.y = -hipHeight / 2;
+    pivot.add(leg);
+    group.add(pivot);
+    return pivot;
+  }
+  const legL = buildLeg(-0.16);
+  const legR = buildLeg(0.16);
+
+  const torsoHeight = 0.75;
+  const torsoRadius = 0.34;
+  const torso = new THREE.Mesh(
+    new THREE.CapsuleGeometry(torsoRadius, torsoHeight - torsoRadius * 2, 4, 8),
+    new THREE.MeshStandardMaterial({ color: 0x3060d0 })
+  );
+  torso.position.y = hipHeight + torsoHeight / 2;
+  group.add(torso);
+
+  const headY = hipHeight + torsoHeight + 0.28;
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.28, 16, 12),
+    new THREE.MeshStandardMaterial({ color: 0xe8b98c })
+  );
+  head.position.y = headY;
+  group.add(head);
+
+  // Facing indicator ("nose"), so turn-around direction is readable at a glance.
+  const nose = new THREE.Mesh(
+    new THREE.ConeGeometry(0.09, 0.28, 8),
+    new THREE.MeshStandardMaterial({ color: 0xff5040 })
+  );
+  nose.rotation.z = -Math.PI / 2;
+  nose.position.set(0.28, headY, 0);
+  group.add(nose);
+
+  return { group, legL, legR };
+}
+const { group: characterMesh, legL, legR } = buildCharacter();
+scene.add(characterMesh);
+
+// --- input --------------------------------------------------------------------
+// Digital-first input: keyboard is on/off by nature, and gamepad stick input
+// is quantized to -1/0/1 too, so both feel equivalent (controller analog
+// nuance can be layered on top later — see design log).
+const heldKeys = new Set();
+let jumpQueued = false;
+window.addEventListener('keydown', e => {
+  heldKeys.add(e.code);
+  // e.repeat is true for OS key-repeat while a key is held down — ignoring
+  // it means holding Space triggers one jump, not an automatic double jump.
+  if (e.code === 'Space' && !e.repeat) jumpQueued = true;
+});
+window.addEventListener('keyup', e => heldKeys.delete(e.code));
+
+let prevGamepadJumpHeld = false;
+
+function readInput() {
+  let dirX = 0;
+  if (heldKeys.has('ArrowLeft') || heldKeys.has('KeyA')) dirX -= 1;
+  if (heldKeys.has('ArrowRight') || heldKeys.has('KeyD')) dirX += 1;
+
+  const pad = navigator.getGamepads ? navigator.getGamepads()[0] : null;
+  if (pad) {
+    const DEAD_ZONE = 0.35;
+    if (dirX === 0 && Math.abs(pad.axes[0]) > DEAD_ZONE) dirX = Math.sign(pad.axes[0]);
+
+    const jumpHeld = !!(pad.buttons[0] && pad.buttons[0].pressed);
+    if (jumpHeld && !prevGamepadJumpHeld) jumpQueued = true;
+    prevGamepadJumpHeld = jumpHeld;
+  }
+  return { dirX };
+}
+
+// --- player state ---------------------------------------------------------
+const player = {
+  pos: { x: 0, y: 0 },
+  prevPos: { x: 0, y: 0 },
+  vel: { x: 0, y: 0 },
+  grounded: true,
+  hasDoubleJump: true,
+  facing: 0,        // visual yaw, radians (0 = facing +X, PI = facing -X)
+  targetFacing: 0,
+  gaitPhase: 0,
+  legAngleL: 0,
+  legAngleR: 0,
+};
+
+function moveToward(current, target, maxDelta) {
+  if (Math.abs(target - current) <= maxDelta) return target;
+  return current + Math.sign(target - current) * maxDelta;
+}
+
+function doJump(speed) {
+  player.vel.y = speed;
+  player.grounded = false;
+  // Clamp horizontal speed to the air-speed cap the instant you leave the
+  // ground, rather than letting ground momentum carry through unchanged.
+  // A small gap between Ground Max Speed and Max Air Speed barely clips
+  // anything; a big gap (like ours) causes a real, felt loss of speed on
+  // takeoff — matching real Melee's behavior for fast-ground characters.
+  player.vel.x = Math.max(-STATS.maxAirSpeed, Math.min(STATS.maxAirSpeed, player.vel.x));
+}
+
+function fixedUpdate(dt, input) {
+  player.prevPos.x = player.pos.x;
+  player.prevPos.y = player.pos.y;
+
+  const { dirX } = input;
+
+  if (player.grounded) {
+    player.vel.x = dirX !== 0
+      ? moveToward(player.vel.x, STATS.groundMaxSpeed * dirX, STATS.groundAccel * dt)
+      : moveToward(player.vel.x, 0, STATS.groundDecel * dt);
+  } else {
+    player.vel.y = Math.max(player.vel.y - STATS.gravity * dt, -STATS.maxFallSpeed);
+    if (dirX !== 0) {
+      player.vel.x += STATS.airAccel * dirX * dt;
+      player.vel.x = Math.max(-STATS.maxAirSpeed, Math.min(STATS.maxAirSpeed, player.vel.x));
+    } else {
+      player.vel.x = moveToward(player.vel.x, 0, STATS.airFriction * dt);
+    }
+  }
+
+  if (jumpQueued) {
+    jumpQueued = false;
+    if (player.grounded) {
+      doJump(STATS.jumpSpeed);
+    } else if (player.hasDoubleJump) {
+      player.hasDoubleJump = false;
+      doJump(STATS.doubleJumpSpeed);
+    }
+  }
+
+  player.pos.x += player.vel.x * dt;
+  player.pos.y += player.vel.y * dt;
+
+  if (!player.grounded && player.pos.y <= 0 && player.vel.y <= 0) {
+    player.pos.y = 0;
+    player.vel.y = 0;
+    player.grounded = true;
+    player.hasDoubleJump = true;
+  }
+
+  const maxX = STAGE.halfX - PLAYER_RADIUS;
+  if (player.pos.x > maxX) { player.pos.x = maxX; player.vel.x = 0; }
+  if (player.pos.x < -maxX) { player.pos.x = -maxX; player.vel.x = 0; }
+
+  // Turn-around (grounded only): physics velocity flips instantly, and the
+  // visual facing eases toward it quickly rather than snapping. Facing
+  // never changes while airborne, no exceptions — matches Melee's
+  // normal-character behavior (only Kirby/Jigglypuff can turn around via
+  // jump there, which we're not modeling).
+  if (player.grounded && dirX !== 0) player.targetFacing = dirX > 0 ? 0 : Math.PI;
+  const TURN_RATE = Math.PI * 12; // radians/sec
+  let diff = player.targetFacing - player.facing;
+  diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+  const maxTurn = TURN_RATE * dt;
+  player.facing += Math.max(-maxTurn, Math.min(maxTurn, diff));
+
+  // Leg animation: gait cycle speed/amplitude scale with ground speed, so
+  // it naturally eases to a standstill as the character decelerates. While
+  // airborne, both legs ease to a fixed tucked pose instead of continuing
+  // the cycle (phase is frozen mid-stride and resumes there on landing).
+  const speedFrac = Math.min(1, Math.abs(player.vel.x) / STATS.groundMaxSpeed);
+  let targetLegL, targetLegR;
+  if (player.grounded) {
+    player.gaitPhase += 2 * Math.PI * ANIM.gaitCyclesPerSecAtMax * speedFrac * dt;
+    targetLegL = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase);
+    targetLegR = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase + Math.PI);
+  } else {
+    targetLegL = ANIM.jumpPoseAngle;
+    targetLegR = ANIM.jumpPoseAngle;
+  }
+  const maxLegDelta = ANIM.legEaseRate * dt;
+  player.legAngleL = moveToward(player.legAngleL, targetLegL, maxLegDelta);
+  player.legAngleR = moveToward(player.legAngleR, targetLegR, maxLegDelta);
+}
+
+// --- main loop ---------------------------------------------------------------
+const hud = document.getElementById('hud');
+let accumulator = 0;
+let lastTime = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let delta = (now - lastTime) / 1000;
+  lastTime = now;
+  delta = Math.min(delta, 0.25); // avoid spiral of death after a tab stall
+  accumulator += delta;
+
+  // Input is sampled once per rendered frame and reused for every fixed
+  // step that frame. Real rollback netcode will need input pulled from a
+  // per-simulated-tick buffer instead — that's future networking work.
+  const input = readInput();
+  while (accumulator >= FIXED_DT) {
+    fixedUpdate(FIXED_DT, input);
+    accumulator -= FIXED_DT;
+  }
+
+  const alpha = accumulator / FIXED_DT;
+  characterMesh.position.set(
+    player.prevPos.x + (player.pos.x - player.prevPos.x) * alpha,
+    player.prevPos.y + (player.pos.y - player.prevPos.y) * alpha,
+    0
+  );
+  characterMesh.rotation.y = player.facing;
+  legL.rotation.z = player.legAngleL;
+  legR.rotation.z = player.legAngleR;
+
+  const speed = Math.abs(player.vel.x);
+  hud.innerHTML =
+    `<b>Move:</b> WASD / Arrow Keys &nbsp; <b>Jump:</b> Space (double jump in air) &nbsp; <b>Gamepad:</b> left stick + A/Cross<br>` +
+    `speed: ${speed.toFixed(1)} &nbsp; vel.y: ${player.vel.y.toFixed(1)} &nbsp; grounded: ${player.grounded} &nbsp; double jump ready: ${player.hasDoubleJump}`;
+
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
