@@ -29,13 +29,18 @@ const STATS = {
   groundMaxSpeed: 14,
   groundAccel: 240,
   groundDecel: 110,
-  gravity: 72,       // was 45; heavier/faster fall onset, Fox-like
-  maxFallSpeed: 28,   // was 22
-  jumpSpeed: 25.3,    // was 20; recalculated so jump HEIGHT is unchanged
-                       // despite the higher gravity (shorter hang time instead)
-  doubleJumpSpeed: 28.7, // was 20 (equal to jumpSpeed); now ~28% taller than
-                          // the first jump, matching Fox's double jump being
-                          // bigger than his own single jump
+  gravity: 85,       // was 72; a little heavier again for a faster-feeling arc
+  maxFallSpeed: 33,   // was 28, scaled up with gravity
+  jumpSpeed: 27.5,    // was 25.3; recalculated so jump HEIGHT is unchanged
+                       // (~4.44) despite the higher gravity — shorter hang
+                       // time instead, which reads as faster
+  doubleJumpSpeed: 31.2, // was 28.7; recalculated the same way, keeping the
+                          // double jump at ~128% of the first jump's height
+  // Fast-fall: pressing down while already falling (not still rising)
+  // instantly snaps you to a faster terminal velocity for the rest of that
+  // fall. Ratio to Max Fall Speed (~1.15x) is toward the low end of
+  // Melee's typical range (was ~1.3x, felt too fast).
+  fastFallSpeed: 38,
   airAccel: 36,
   // Air friction: a separate, weaker deceleration that only applies when no
   // direction is held in the air (Melee has this; we were missing it
@@ -52,6 +57,19 @@ const ANIM = {
   gaitCyclesPerSecAtMax: 2.2,// full stride cycles per second at max ground speed
   legEaseRate: Math.PI * 10, // radians/sec, how fast a leg eases toward its target angle
   jumpPoseAngle: 0.35,       // radians, both legs tuck to this angle while airborne
+  // Double-jump tuck: legs snap to a tighter tuck for a moment right when
+  // you double-jump, then relax back to the normal jumpPoseAngle above.
+  doubleJumpTuckAngle: 1.15,
+  doubleJumpTuckDuration: 0.18, // seconds
+  // Squash (landing) / stretch (takeoff): one signed value drives both —
+  // negative squashes, positive stretches, both ease back to 0. Applied to
+  // the character's scale in the render loop.
+  landingSquashKick: -0.3,
+  takeoffStretchKick: 0.22,
+  stretchEaseRate: 1.6, // units/sec, how fast bodyStretch returns to 0
+  // Turn dust: only puffs if you were already going at least this fraction
+  // of Ground Max Speed when you reversed — keeps small wiggles silent.
+  turnDustSpeedFraction: 0.5,
 };
 
 // Strict 2D movement plane: only X (left/right) and Y (jumping) are
@@ -151,6 +169,45 @@ function buildCharacter() {
 const { group: characterMesh, legL, legR } = buildCharacter();
 scene.add(characterMesh);
 
+// --- turn dust (minimal particle burst) --------------------------------------
+// Cosmetic only, updated with real (render) delta time rather than the fixed
+// physics step — never feeds back into simulation state, so using
+// Math.random() here doesn't break determinism anywhere that matters.
+const dustGeometry = new THREE.SphereGeometry(0.1, 6, 5);
+const dustMaterial = new THREE.MeshStandardMaterial({ color: 0xc9b48a });
+const dustParticles = [];
+
+function spawnTurnDust(x, y) {
+  for (let i = 0; i < 6; i++) {
+    const mesh = new THREE.Mesh(dustGeometry, dustMaterial);
+    mesh.position.set(x, y + 0.05, (Math.random() - 0.5) * 0.3);
+    scene.add(mesh);
+    dustParticles.push({
+      mesh,
+      vel: { x: (Math.random() - 0.5) * 3, y: Math.random() * 1.5 + 0.8, z: (Math.random() - 0.5) * 3 },
+      life: 0,
+      maxLife: 0.3 + Math.random() * 0.15,
+    });
+  }
+}
+
+function updateDustParticles(delta) {
+  for (let i = dustParticles.length - 1; i >= 0; i--) {
+    const p = dustParticles[i];
+    p.life += delta;
+    if (p.life >= p.maxLife) {
+      scene.remove(p.mesh);
+      dustParticles.splice(i, 1);
+      continue;
+    }
+    p.vel.y -= 6 * delta;
+    p.mesh.position.x += p.vel.x * delta;
+    p.mesh.position.y += p.vel.y * delta;
+    p.mesh.position.z += p.vel.z * delta;
+    p.mesh.scale.setScalar(Math.max(1 - p.life / p.maxLife, 0.001));
+  }
+}
+
 // --- input --------------------------------------------------------------------
 // Digital-first input: keyboard is on/off by nature, and gamepad stick input
 // is quantized to -1/0/1 too, so both feel equivalent (controller analog
@@ -171,17 +228,20 @@ function readInput() {
   let dirX = 0;
   if (heldKeys.has('ArrowLeft') || heldKeys.has('KeyA')) dirX -= 1;
   if (heldKeys.has('ArrowRight') || heldKeys.has('KeyD')) dirX += 1;
+  let downHeld = heldKeys.has('ArrowDown') || heldKeys.has('KeyS');
 
   const pad = navigator.getGamepads ? navigator.getGamepads()[0] : null;
   if (pad) {
     const DEAD_ZONE = 0.35;
     if (dirX === 0 && Math.abs(pad.axes[0]) > DEAD_ZONE) dirX = Math.sign(pad.axes[0]);
+    if (!downHeld && pad.axes[1] > DEAD_ZONE) downHeld = true;
+    if (!downHeld && pad.buttons[13] && pad.buttons[13].pressed) downHeld = true; // D-pad down
 
     const jumpHeld = !!(pad.buttons[0] && pad.buttons[0].pressed);
     if (jumpHeld && !prevGamepadJumpHeld) jumpQueued = true;
     prevGamepadJumpHeld = jumpHeld;
   }
-  return { dirX };
+  return { dirX, downHeld };
 }
 
 // --- player state ---------------------------------------------------------
@@ -193,6 +253,10 @@ const player = {
   hasDoubleJump: true,
   facing: 0,        // visual yaw, radians (0 = facing +X, PI = facing -X)
   targetFacing: 0,
+  fastFalling: false,
+  wasReversalInput: false, // for edge-detecting turn-dust triggers
+  doubleJumpFlipTimer: 0,
+  bodyStretch: 0,   // negative = squashed, positive = stretched, eases to 0
   gaitPhase: 0,
   legAngleL: 0,
   legAngleR: 0,
@@ -206,6 +270,8 @@ function moveToward(current, target, maxDelta) {
 function doJump(speed) {
   player.vel.y = speed;
   player.grounded = false;
+  player.fastFalling = false; // a fresh jump needs a fresh fast-fall input
+  player.bodyStretch = ANIM.takeoffStretchKick;
   // Clamp horizontal speed to the air-speed cap the instant you leave the
   // ground, rather than letting ground momentum carry through unchanged.
   // A small gap between Ground Max Speed and Max Air Speed barely clips
@@ -218,14 +284,32 @@ function fixedUpdate(dt, input) {
   player.prevPos.x = player.pos.x;
   player.prevPos.y = player.pos.y;
 
-  const { dirX } = input;
+  const { dirX, downHeld } = input;
+
+  // Turn dust: fires once, right when you newly try to move opposite your
+  // current velocity, if you were going at least turnDustSpeedFraction of
+  // Ground Max Speed at that moment (checked BEFORE this tick's physics).
+  const isReversalInput = player.grounded && dirX !== 0 && player.vel.x !== 0 &&
+    Math.sign(dirX) !== Math.sign(player.vel.x);
+  if (isReversalInput && !player.wasReversalInput &&
+      Math.abs(player.vel.x) > STATS.groundMaxSpeed * ANIM.turnDustSpeedFraction) {
+    spawnTurnDust(player.pos.x, player.pos.y);
+  }
+  player.wasReversalInput = isReversalInput;
 
   if (player.grounded) {
     player.vel.x = dirX !== 0
       ? moveToward(player.vel.x, STATS.groundMaxSpeed * dirX, STATS.groundAccel * dt)
       : moveToward(player.vel.x, 0, STATS.groundDecel * dt);
   } else {
-    player.vel.y = Math.max(player.vel.y - STATS.gravity * dt, -STATS.maxFallSpeed);
+    // Fast-fall: pressing down while already moving downward instantly
+    // snaps to a faster terminal velocity for the rest of this fall.
+    if (!player.fastFalling && downHeld && player.vel.y <= 0) {
+      player.fastFalling = true;
+      player.vel.y = -STATS.fastFallSpeed;
+    }
+    const fallCap = player.fastFalling ? STATS.fastFallSpeed : STATS.maxFallSpeed;
+    player.vel.y = Math.max(player.vel.y - STATS.gravity * dt, -fallCap);
     if (dirX !== 0) {
       player.vel.x += STATS.airAccel * dirX * dt;
       player.vel.x = Math.max(-STATS.maxAirSpeed, Math.min(STATS.maxAirSpeed, player.vel.x));
@@ -241,6 +325,7 @@ function fixedUpdate(dt, input) {
     } else if (player.hasDoubleJump) {
       player.hasDoubleJump = false;
       doJump(STATS.doubleJumpSpeed);
+      player.doubleJumpFlipTimer = ANIM.doubleJumpTuckDuration;
     }
   }
 
@@ -252,7 +337,11 @@ function fixedUpdate(dt, input) {
     player.vel.y = 0;
     player.grounded = true;
     player.hasDoubleJump = true;
+    player.fastFalling = false;
+    player.bodyStretch = ANIM.landingSquashKick;
   }
+
+  player.bodyStretch = moveToward(player.bodyStretch, 0, ANIM.stretchEaseRate * dt);
 
   const maxX = STAGE.halfX - PLAYER_RADIUS;
   if (player.pos.x > maxX) { player.pos.x = maxX; player.vel.x = 0; }
@@ -280,6 +369,12 @@ function fixedUpdate(dt, input) {
     player.gaitPhase += 2 * Math.PI * ANIM.gaitCyclesPerSecAtMax * speedFrac * dt;
     targetLegL = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase);
     targetLegR = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase + Math.PI);
+  } else if (player.doubleJumpFlipTimer > 0) {
+    // Brief, tighter tuck right after a double jump, then relaxes back to
+    // the normal airborne pose once the timer runs out.
+    player.doubleJumpFlipTimer -= dt;
+    targetLegL = ANIM.doubleJumpTuckAngle;
+    targetLegR = ANIM.doubleJumpTuckAngle;
   } else {
     targetLegL = ANIM.jumpPoseAngle;
     targetLegR = ANIM.jumpPoseAngle;
@@ -317,13 +412,19 @@ function frame(now) {
     0
   );
   characterMesh.rotation.y = player.facing;
+  characterMesh.scale.set(
+    1 - player.bodyStretch * 0.5,
+    1 + player.bodyStretch,
+    1 - player.bodyStretch * 0.5
+  );
   legL.rotation.z = player.legAngleL;
   legR.rotation.z = player.legAngleR;
+  updateDustParticles(delta);
 
   const speed = Math.abs(player.vel.x);
   hud.innerHTML =
-    `<b>Move:</b> WASD / Arrow Keys &nbsp; <b>Jump:</b> Space (double jump in air) &nbsp; <b>Gamepad:</b> left stick + A/Cross<br>` +
-    `speed: ${speed.toFixed(1)} &nbsp; vel.y: ${player.vel.y.toFixed(1)} &nbsp; grounded: ${player.grounded} &nbsp; double jump ready: ${player.hasDoubleJump}`;
+    `<b>Move:</b> WASD / Arrow Keys &nbsp; <b>Jump:</b> Space (double jump in air) &nbsp; <b>Fast-fall:</b> Down (while falling) &nbsp; <b>Gamepad:</b> left stick + A/Cross<br>` +
+    `speed: ${speed.toFixed(1)} &nbsp; vel.y: ${player.vel.y.toFixed(1)} &nbsp; grounded: ${player.grounded} &nbsp; double jump ready: ${player.hasDoubleJump} &nbsp; fast-falling: ${player.fastFalling}`;
 
   renderer.render(scene, camera);
 }
