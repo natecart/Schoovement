@@ -70,6 +70,32 @@ const ANIM = {
   // Turn dust: only puffs if you were already going at least this fraction
   // of Ground Max Speed when you reversed — keeps small wiggles silent.
   turnDustSpeedFraction: 0.5,
+  // Arms swing opposite their same-side leg (contralateral gait): armL
+  // shares legR's phase and vice versa. Smaller amplitude than the legs.
+  armSwingMax: 0.6,
+  armJumpPoseAngle: 0.15,
+  // Crouch: sustained (not decaying) squash via the same bodyStretch value
+  // used for landing/takeoff, active the whole time down is held grounded.
+  // Eases in much faster than landing/takeoff (~5 frames at 60fps) since
+  // this is a held pose transition, not an impact — should feel immediate.
+  crouchSquash: -0.35,
+  crouchEaseRate: 4.5,
+  // Lean: tilts the upper body (not the legs) toward local-forward, scaled
+  // by ground speed, for a more athletic running look.
+  leanMax: 0.22,
+  leanEaseRate: 4, // radians/sec
+  // "Naruto run": once running at least narutoBlendStart of Ground Max Speed
+  // AND committed to one direction for narutoMinDistance, arms blend from
+  // the normal alternating swing into both sweeping back together. The
+  // blend itself is time-based (narutoTransitionDuration), independent of
+  // the fast per-frame leg/arm ease rate, so it reads as a deliberate raise
+  // rather than a snap. Angle magnitude > PI/2 so the arms end up raised
+  // behind, not just trailing at hip level (rotating a hanging arm past 90°
+  // lifts it up).
+  narutoArmAngle: -1.9,
+  narutoBlendStart: 0.6,
+  narutoMinDistance: 3,
+  narutoTransitionDuration: 0.5, // seconds, both raising and lowering
 };
 
 // Strict 2D movement plane: only X (left/right) and Y (jumping) are
@@ -94,8 +120,9 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87ceeb);
 
 const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
-camera.position.set(0, 7, 17);
-camera.lookAt(0, 2.5, 0);
+camera.position.set(0, 9, 17);
+camera.lookAt(0, 3.8, 0); // aimed higher than before, so more sky and less
+                          // foreground shows — gives headroom to see jumps
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -121,11 +148,13 @@ function buildCharacter() {
   const hipHeight = 0.85;
   const legRadius = 0.12;
 
-  // Each leg is a pivot Group hinged at the hip; rotating it around Z swings
-  // the leg forward/back in the character's local X-Y (facing) plane.
-  function buildLeg(sideX) {
+  // Each leg is a pivot Group hinged at the hip, offset along Z (the axis
+  // perpendicular to facing — real anatomical left/right hip spacing).
+  // Rotating the pivot around Z still swings the leg forward/back in the
+  // character's local X-Y (facing) plane, independent of this Z offset.
+  function buildLeg(sideZ) {
     const pivot = new THREE.Group();
-    pivot.position.set(sideX, hipHeight, 0);
+    pivot.position.set(0, hipHeight, sideZ);
     const leg = new THREE.Mesh(
       new THREE.CapsuleGeometry(legRadius, hipHeight - legRadius * 2, 4, 8),
       new THREE.MeshStandardMaterial({ color: 0x24418f })
@@ -138,6 +167,11 @@ function buildCharacter() {
   const legL = buildLeg(-0.16);
   const legR = buildLeg(0.16);
 
+  // Torso/head/arms live under a separate "upper body" pivot so the running
+  // lean can tilt them without affecting the independently-animated legs.
+  const upperBody = new THREE.Group();
+  group.add(upperBody);
+
   const torsoHeight = 0.75;
   const torsoRadius = 0.34;
   const torso = new THREE.Mesh(
@@ -145,7 +179,7 @@ function buildCharacter() {
     new THREE.MeshStandardMaterial({ color: 0x3060d0 })
   );
   torso.position.y = hipHeight + torsoHeight / 2;
-  group.add(torso);
+  upperBody.add(torso);
 
   const headY = hipHeight + torsoHeight + 0.28;
   const head = new THREE.Mesh(
@@ -153,7 +187,7 @@ function buildCharacter() {
     new THREE.MeshStandardMaterial({ color: 0xe8b98c })
   );
   head.position.y = headY;
-  group.add(head);
+  upperBody.add(head);
 
   // Facing indicator ("nose"), so turn-around direction is readable at a glance.
   const nose = new THREE.Mesh(
@@ -162,11 +196,30 @@ function buildCharacter() {
   );
   nose.rotation.z = -Math.PI / 2;
   nose.position.set(0.28, headY, 0);
-  group.add(nose);
+  upperBody.add(nose);
 
-  return { group, legL, legR };
+  // Arms: same hinge-pivot pattern as the legs, offset along Z, shoulder-height.
+  const shoulderHeight = hipHeight + torsoHeight - 0.12;
+  const armLength = 0.62;
+  const armRadius = 0.09;
+  function buildArm(sideZ) {
+    const pivot = new THREE.Group();
+    pivot.position.set(0, shoulderHeight, sideZ);
+    const arm = new THREE.Mesh(
+      new THREE.CapsuleGeometry(armRadius, armLength - armRadius * 2, 4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x3060d0 })
+    );
+    arm.position.y = -armLength / 2;
+    pivot.add(arm);
+    upperBody.add(pivot);
+    return pivot;
+  }
+  const armL = buildArm(-0.38);
+  const armR = buildArm(0.38);
+
+  return { group, legL, legR, armL, armR, upperBody };
 }
-const { group: characterMesh, legL, legR } = buildCharacter();
+const { group: characterMesh, legL, legR, armL, armR, upperBody } = buildCharacter();
 scene.add(characterMesh);
 
 // --- turn dust (minimal particle burst) --------------------------------------
@@ -260,6 +313,12 @@ const player = {
   gaitPhase: 0,
   legAngleL: 0,
   legAngleR: 0,
+  armAngleL: 0,
+  armAngleR: 0,
+  upperBodyLean: 0,
+  sameDirDistance: 0, // resets whenever travel direction changes
+  lastMoveDir: 0,
+  narutoBlendFactor: 0, // 0-1, eases over narutoTransitionDuration either way
 };
 
 function moveToward(current, target, maxDelta) {
@@ -341,7 +400,13 @@ function fixedUpdate(dt, input) {
     player.bodyStretch = ANIM.landingSquashKick;
   }
 
-  player.bodyStretch = moveToward(player.bodyStretch, 0, ANIM.stretchEaseRate * dt);
+  // Crouch: holding down while grounded sustains a squash target instead of
+  // the momentary landing/takeoff kicks easing back to 0. Uses the same
+  // bodyStretch value/mechanism, just a held target rather than an impulse.
+  const crouching = player.grounded && downHeld;
+  const stretchTarget = crouching ? ANIM.crouchSquash : 0;
+  const stretchRate = crouching ? ANIM.crouchEaseRate : ANIM.stretchEaseRate;
+  player.bodyStretch = moveToward(player.bodyStretch, stretchTarget, stretchRate * dt);
 
   const maxX = STAGE.halfX - PLAYER_RADIUS;
   if (player.pos.x > maxX) { player.pos.x = maxX; player.vel.x = 0; }
@@ -358,6 +423,22 @@ function fixedUpdate(dt, input) {
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));
   const maxTurn = TURN_RATE * dt;
   player.facing += Math.max(-maxTurn, Math.min(maxTurn, diff));
+
+  // Same-direction commitment tracking: resets the instant travel direction
+  // changes, so quick dash-dance taps never accumulate enough distance to
+  // trigger the Naruto-run pose below.
+  if (player.grounded && player.vel.x !== 0) {
+    const moveDir = Math.sign(player.vel.x);
+    if (moveDir !== player.lastMoveDir) {
+      player.sameDirDistance = 0;
+      player.lastMoveDir = moveDir;
+    } else {
+      player.sameDirDistance += Math.abs(player.vel.x) * dt;
+    }
+  } else {
+    player.sameDirDistance = 0;
+    player.lastMoveDir = 0;
+  }
 
   // Leg animation: gait cycle speed/amplitude scale with ground speed, so
   // it naturally eases to a standstill as the character decelerates. While
@@ -382,6 +463,42 @@ function fixedUpdate(dt, input) {
   const maxLegDelta = ANIM.legEaseRate * dt;
   player.legAngleL = moveToward(player.legAngleL, targetLegL, maxLegDelta);
   player.legAngleR = moveToward(player.legAngleR, targetLegR, maxLegDelta);
+
+  // Naruto-run blend: a smooth 0-1 value that only ramps toward 1 while
+  // BOTH gate conditions hold (fast enough, committed far enough), and
+  // ramps back toward 0 the instant either stops holding. This is a
+  // time-based ease (narutoTransitionDuration), separate from the fast
+  // per-frame arm ease rate below, so the pose reads as a deliberate raise
+  // rather than snapping in the moment the distance threshold is crossed.
+  const narutoGateOpen = speedFrac >= ANIM.narutoBlendStart &&
+    player.sameDirDistance >= ANIM.narutoMinDistance;
+  player.narutoBlendFactor = moveToward(
+    player.narutoBlendFactor,
+    narutoGateOpen ? 1 : 0,
+    (1 / ANIM.narutoTransitionDuration) * dt
+  );
+
+  // Arms: contralateral to the legs (armL shares legR's phase and vice
+  // versa), reusing the same gaitPhase/speedFrac so they stay in lockstep.
+  // Blends into both arms held back together ("Naruto run") per the factor above.
+  let targetArmL, targetArmR;
+  if (player.grounded) {
+    const normalArmL = ANIM.armSwingMax * speedFrac * Math.sin(player.gaitPhase + Math.PI);
+    const normalArmR = ANIM.armSwingMax * speedFrac * Math.sin(player.gaitPhase);
+    targetArmL = normalArmL + (ANIM.narutoArmAngle - normalArmL) * player.narutoBlendFactor;
+    targetArmR = normalArmR + (ANIM.narutoArmAngle - normalArmR) * player.narutoBlendFactor;
+  } else {
+    targetArmL = ANIM.armJumpPoseAngle;
+    targetArmR = ANIM.armJumpPoseAngle;
+  }
+  player.armAngleL = moveToward(player.armAngleL, targetArmL, maxLegDelta);
+  player.armAngleR = moveToward(player.armAngleR, targetArmR, maxLegDelta);
+
+  // Lean: tilts the upper body toward local-forward, scaled by ground speed.
+  // Defined relative to the character's own facing (not world direction),
+  // so it automatically points the right way after the parent's yaw.
+  const leanTarget = player.grounded ? -ANIM.leanMax * speedFrac : 0;
+  player.upperBodyLean = moveToward(player.upperBodyLean, leanTarget, ANIM.leanEaseRate * dt);
 }
 
 // --- main loop ---------------------------------------------------------------
@@ -419,11 +536,14 @@ function frame(now) {
   );
   legL.rotation.z = player.legAngleL;
   legR.rotation.z = player.legAngleR;
+  armL.rotation.z = player.armAngleL;
+  armR.rotation.z = player.armAngleR;
+  upperBody.rotation.z = player.upperBodyLean;
   updateDustParticles(delta);
 
   const speed = Math.abs(player.vel.x);
   hud.innerHTML =
-    `<b>Move:</b> WASD / Arrow Keys &nbsp; <b>Jump:</b> Space (double jump in air) &nbsp; <b>Fast-fall:</b> Down (while falling) &nbsp; <b>Gamepad:</b> left stick + A/Cross<br>` +
+    `<b>Move:</b> WASD / Arrow Keys &nbsp; <b>Jump:</b> Space (double jump in air) &nbsp; <b>Down:</b> crouch (grounded) / fast-fall (airborne) &nbsp; <b>Gamepad:</b> left stick + A/Cross<br>` +
     `speed: ${speed.toFixed(1)} &nbsp; vel.y: ${player.vel.y.toFixed(1)} &nbsp; grounded: ${player.grounded} &nbsp; double jump ready: ${player.hasDoubleJump} &nbsp; fast-falling: ${player.fastFalling}`;
 
   renderer.render(scene, camera);
