@@ -56,9 +56,36 @@ const ANIM = {
   legSwingMax: 0.9,          // radians, full leg swing amplitude at max ground speed
   gaitCyclesPerSecAtMax: 2.2,// full stride cycles per second at max ground speed
   legEaseRate: Math.PI * 10, // radians/sec, how fast a leg eases toward its target angle
-  jumpPoseAngle: 0.35,       // radians, both legs tuck to this angle while airborne
+  // Knee bend: peaks during forward swing (foot clearance), stays near
+  // straight during stance/push-off. First-pass approximation, not a real
+  // IK solve — likely needs tuning once seen in motion.
+  kneeBendMax: 1.1,
+  // Default airborne pose ("Marth jump"): one leg trails back, the other
+  // drives up with a bent knee (basketball-dunk-style knee raise), plus an
+  // asymmetric arm pose — one arm ("sword arm") extended, the other relaxed
+  // and trailing.
+  jumpPoseLegAngle: -0.45,       // trailing leg, hip
+  jumpPoseKneeAngle: 0.25,       // trailing leg, knee (mostly straight)
+  jumpPoseRaisedLegAngle: 1.0,   // driven-up leg, hip (raised and forward)
+  jumpPoseRaisedKneeAngle: 1.0,  // driven-up leg, knee (folded under)
+  jumpPoseSwordArmAngle: 0.9,
+  jumpPoseOffArmAngle: -0.25,
+  // Which side is "active" (raised leg + sword arm) flips between the first
+  // jump and the double jump — see player.jumpPoseFlipped — so the pose
+  // doesn't just repeat itself.
+  // A small continuous sine wiggle on the active leg/arm so the pose reads
+  // as alive rather than a frozen snapshot for the whole flight.
+  jumpPoseWiggleAmplitude: 0.08, // radians
+  jumpPoseWiggleFreq: Math.PI * 5, // radians/sec (~2.5 wiggles per second)
+  // Hip/shoulder counter-rotation: while airborne, the pelvis twists (yaw)
+  // to bring the raised leg's hip forward, and the upper body twists the
+  // opposite way (shoulders lead on the trailing-leg side) — the athletic
+  // torque you get any time one leg drives forward. Only active airborne.
+  bodyTwistMax: 0.25, // radians, pelvis twist
+  bodyTwistEaseRate: 6, // radians/sec
+  shoulderCounterTwistFactor: 1.0, // upperBody twist = -bodyTwist * this
   // Double-jump tuck: legs snap to a tighter tuck for a moment right when
-  // you double-jump, then relax back to the normal jumpPoseAngle above.
+  // you double-jump, then relax back to the jumpPoseLegAngle pose above.
   doubleJumpTuckAngle: 1.15,
   doubleJumpTuckDuration: 0.18, // seconds
   // Squash (landing) / stretch (takeoff): one signed value drives both —
@@ -73,7 +100,6 @@ const ANIM = {
   // Arms swing opposite their same-side leg (contralateral gait): armL
   // shares legR's phase and vice versa. Smaller amplitude than the legs.
   armSwingMax: 0.6,
-  armJumpPoseAngle: 0.15,
   // Crouch: sustained (not decaying) squash via the same bodyStretch value
   // used for landing/takeoff, active the whole time down is held grounded.
   // Eases in much faster than landing/takeoff (~5 frames at 60fps) since
@@ -146,44 +172,114 @@ function buildCharacter() {
   const group = new THREE.Group();
 
   const hipHeight = 0.85;
-  const legRadius = 0.12;
+  const thighLength = 0.44;
+  const shinLength = 0.41; // thighLength + shinLength == hipHeight, so a
+                            // fully straight leg (hip=0, knee=0) still
+                            // reaches exactly to the ground, as before.
+  const thighRadius = 0.115;
+  const shinRadius = 0.095;
 
-  // Each leg is a pivot Group hinged at the hip, offset along Z (the axis
-  // perpendicular to facing — real anatomical left/right hip spacing).
-  // Rotating the pivot around Z still swings the leg forward/back in the
-  // character's local X-Y (facing) plane, independent of this Z offset.
+  // Both legs live under a "pelvis" pivot, positioned at hip height, so the
+  // hips can twist (rotate around Y) independently of — and opposite to —
+  // the upperBody's own twist below, for the athletic hip/shoulder
+  // counter-rotation you get when one leg drives forward.
+  const pelvis = new THREE.Group();
+  pelvis.position.y = hipHeight;
+  group.add(pelvis);
+
+  // Two-segment leg: a hip pivot (offset along Z — the axis perpendicular
+  // to facing, i.e. real anatomical left/right hip spacing) holds the
+  // thigh, and a knee pivot nested INSIDE it (at the thigh's far end) holds
+  // the shin. Rotating either pivot around Z swings that segment
+  // forward/back in the character's local X-Y (facing) plane; the knee
+  // pivot's rotation is relative to the thigh's, so a "bend" is just a
+  // further backward rotation regardless of the thigh's current angle.
+  // A small sphere at each pivot's origin doesn't move when that pivot
+  // rotates (it's centered on the rotation axis), so it stays put and
+  // visually bridges the joint gap that would otherwise open up mid-swing.
   function buildLeg(sideZ) {
-    const pivot = new THREE.Group();
-    pivot.position.set(0, hipHeight, sideZ);
-    const leg = new THREE.Mesh(
-      new THREE.CapsuleGeometry(legRadius, hipHeight - legRadius * 2, 4, 8),
+    const hipPivot = new THREE.Group();
+    hipPivot.position.set(0, 0, sideZ); // relative to pelvis, which is already at hip height
+
+    const hipSocket = new THREE.Mesh(
+      new THREE.SphereGeometry(thighRadius * 1.05, 8, 6),
       new THREE.MeshStandardMaterial({ color: 0x24418f })
     );
-    leg.position.y = -hipHeight / 2;
-    pivot.add(leg);
-    group.add(pivot);
-    return pivot;
+    hipPivot.add(hipSocket);
+
+    const thigh = new THREE.Mesh(
+      new THREE.CapsuleGeometry(thighRadius, thighLength - thighRadius * 2, 4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x24418f })
+    );
+    thigh.position.y = -thighLength / 2;
+    hipPivot.add(thigh);
+
+    const kneePivot = new THREE.Group();
+    kneePivot.position.y = -thighLength;
+    hipPivot.add(kneePivot);
+
+    const kneeSocket = new THREE.Mesh(
+      new THREE.SphereGeometry(shinRadius * 1.05, 8, 6),
+      new THREE.MeshStandardMaterial({ color: 0x24418f })
+    );
+    kneePivot.add(kneeSocket);
+
+    const shin = new THREE.Mesh(
+      new THREE.CapsuleGeometry(shinRadius, shinLength - shinRadius * 2, 4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x24418f })
+    );
+    shin.position.y = -shinLength / 2;
+    kneePivot.add(shin);
+
+    pelvis.add(hipPivot);
+    return { hipPivot, kneePivot };
   }
   const legL = buildLeg(-0.16);
   const legR = buildLeg(0.16);
 
   // Torso/head/arms live under a separate "upper body" pivot so the running
   // lean can tilt them without affecting the independently-animated legs.
+  // Positioned AT hip height (not left at 0) so rotating it for the lean
+  // pivots from the waist, where it actually meets the legs — otherwise it
+  // rotates around a point down at ground level, swinging the torso through
+  // an arc that visibly disconnects it from the hips.
   const upperBody = new THREE.Group();
+  upperBody.position.y = hipHeight;
   group.add(upperBody);
 
-  const torsoHeight = 0.75;
-  const torsoRadius = 0.34;
+  // Torso: a tapered cylinder — broader "shoulders" at the top, narrower
+  // "waist" at the bottom — for an athletic V-taper silhouette. A capsule
+  // can't taper (uniform radius along its length), so this switches
+  // primitives rather than just resizing the old one.
+  const torsoHeight = 0.72;
+  const torsoRadiusTop = 0.33;    // shoulders
+  const torsoRadiusBottom = 0.21; // waist
   const torso = new THREE.Mesh(
-    new THREE.CapsuleGeometry(torsoRadius, torsoHeight - torsoRadius * 2, 4, 8),
+    new THREE.CylinderGeometry(torsoRadiusTop, torsoRadiusBottom, torsoHeight, 8),
     new THREE.MeshStandardMaterial({ color: 0x3060d0 })
   );
-  torso.position.y = hipHeight + torsoHeight / 2;
+  torso.position.y = torsoHeight / 2; // relative to upperBody's origin, which is already at hip height
   upperBody.add(torso);
 
-  const headY = hipHeight + torsoHeight + 0.28;
+  // Neck: bridges the torso top and the head. This joint never rotates
+  // independently (no head-turning animation yet), so unlike the knee/hip
+  // it just needs a small overlap on each end rather than a socket sphere.
+  const overlap = 0.03;
+  const neckRadius = 0.10;
+  const neckHeight = 0.16;
+  const neckBottom = torsoHeight - overlap;
+  const neck = new THREE.Mesh(
+    new THREE.CylinderGeometry(neckRadius, neckRadius, neckHeight, 8),
+    new THREE.MeshStandardMaterial({ color: 0xe8b98c })
+  );
+  neck.position.y = neckBottom + neckHeight / 2;
+  upperBody.add(neck);
+
+  const headRadius = 0.23;
+  const headBottom = neckBottom + neckHeight - overlap;
+  const headY = headBottom + headRadius;
   const head = new THREE.Mesh(
-    new THREE.SphereGeometry(0.28, 16, 12),
+    new THREE.SphereGeometry(headRadius, 16, 12),
     new THREE.MeshStandardMaterial({ color: 0xe8b98c })
   );
   head.position.y = headY;
@@ -191,15 +287,15 @@ function buildCharacter() {
 
   // Facing indicator ("nose"), so turn-around direction is readable at a glance.
   const nose = new THREE.Mesh(
-    new THREE.ConeGeometry(0.09, 0.28, 8),
+    new THREE.ConeGeometry(0.09, headRadius, 8),
     new THREE.MeshStandardMaterial({ color: 0xff5040 })
   );
   nose.rotation.z = -Math.PI / 2;
-  nose.position.set(0.28, headY, 0);
+  nose.position.set(headRadius, headY, 0);
   upperBody.add(nose);
 
   // Arms: same hinge-pivot pattern as the legs, offset along Z, shoulder-height.
-  const shoulderHeight = hipHeight + torsoHeight - 0.12;
+  const shoulderHeight = torsoHeight - 0.1; // relative to upperBody's origin (already at hip height)
   const armLength = 0.62;
   const armRadius = 0.09;
   function buildArm(sideZ) {
@@ -217,9 +313,9 @@ function buildCharacter() {
   const armL = buildArm(-0.38);
   const armR = buildArm(0.38);
 
-  return { group, legL, legR, armL, armR, upperBody };
+  return { group, legL, legR, armL, armR, upperBody, pelvis };
 }
-const { group: characterMesh, legL, legR, armL, armR, upperBody } = buildCharacter();
+const { group: characterMesh, legL, legR, armL, armR, upperBody, pelvis } = buildCharacter();
 scene.add(characterMesh);
 
 // --- turn dust (minimal particle burst) --------------------------------------
@@ -309,13 +405,18 @@ const player = {
   fastFalling: false,
   wasReversalInput: false, // for edge-detecting turn-dust triggers
   doubleJumpFlipTimer: 0,
+  jumpPoseFlipped: false, // which side is "active" (raised leg + sword arm)
+  airTime: 0, // seconds since the current jump started, drives the pose wiggle
   bodyStretch: 0,   // negative = squashed, positive = stretched, eases to 0
   gaitPhase: 0,
   legAngleL: 0,
   legAngleR: 0,
+  kneeAngleL: 0,
+  kneeAngleR: 0,
   armAngleL: 0,
   armAngleR: 0,
   upperBodyLean: 0,
+  bodyTwist: 0, // pelvis yaw twist; upperBody twists opposite this while airborne
   sameDirDistance: 0, // resets whenever travel direction changes
   lastMoveDir: 0,
   narutoBlendFactor: 0, // 0-1, eases over narutoTransitionDuration either way
@@ -331,6 +432,7 @@ function doJump(speed) {
   player.grounded = false;
   player.fastFalling = false; // a fresh jump needs a fresh fast-fall input
   player.bodyStretch = ANIM.takeoffStretchKick;
+  player.airTime = 0; // restarts the jump-pose wiggle phase each jump
   // Clamp horizontal speed to the air-speed cap the instant you leave the
   // ground, rather than letting ground momentum carry through unchanged.
   // A small gap between Ground Max Speed and Max Air Speed barely clips
@@ -357,8 +459,12 @@ function fixedUpdate(dt, input) {
   player.wasReversalInput = isReversalInput;
 
   if (player.grounded) {
-    player.vel.x = dirX !== 0
-      ? moveToward(player.vel.x, STATS.groundMaxSpeed * dirX, STATS.groundAccel * dt)
+    // Can't accelerate while crouching (holding down) — existing speed
+    // bleeds off via normal deceleration instead, so you skid to a stop
+    // rather than sprinting in a squashed pose.
+    const moveDirX = downHeld ? 0 : dirX;
+    player.vel.x = moveDirX !== 0
+      ? moveToward(player.vel.x, STATS.groundMaxSpeed * moveDirX, STATS.groundAccel * dt)
       : moveToward(player.vel.x, 0, STATS.groundDecel * dt);
   } else {
     // Fast-fall: pressing down while already moving downward instantly
@@ -381,10 +487,12 @@ function fixedUpdate(dt, input) {
     jumpQueued = false;
     if (player.grounded) {
       doJump(STATS.jumpSpeed);
+      player.jumpPoseFlipped = false; // first jump always starts in the default orientation
     } else if (player.hasDoubleJump) {
       player.hasDoubleJump = false;
       doJump(STATS.doubleJumpSpeed);
       player.doubleJumpFlipTimer = ANIM.doubleJumpTuckDuration;
+      player.jumpPoseFlipped = true; // double jump swaps which leg/arm is active
     }
   }
 
@@ -445,24 +553,61 @@ function fixedUpdate(dt, input) {
   // airborne, both legs ease to a fixed tucked pose instead of continuing
   // the cycle (phase is frozen mid-stride and resumes there on landing).
   const speedFrac = Math.min(1, Math.abs(player.vel.x) / STATS.groundMaxSpeed);
-  let targetLegL, targetLegR;
+
+  if (!player.grounded) player.airTime += dt;
+  // Small continuous sine wiggle applied to the jump pose's "active" limbs
+  // (raised leg + sword arm) so a long hang time doesn't read as frozen.
+  const jumpPoseWiggle = ANIM.jumpPoseWiggleAmplitude * Math.sin(player.airTime * ANIM.jumpPoseWiggleFreq);
+
+  let targetLegL, targetLegR, targetKneeL, targetKneeR;
   if (player.grounded) {
     player.gaitPhase += 2 * Math.PI * ANIM.gaitCyclesPerSecAtMax * speedFrac * dt;
     targetLegL = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase);
     targetLegR = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase + Math.PI);
+    // Knee bend: a half-wave-rectified cosine peaks when the hip is at
+    // neutral swinging forward (cos(phase)=1, foot lifting for clearance)
+    // and is clamped to zero for the half-cycle around stance/push-off
+    // (cos(phase)<0), so only the swinging leg's knee bends at a time.
+    targetKneeL = ANIM.kneeBendMax * speedFrac * Math.max(0, Math.cos(player.gaitPhase));
+    targetKneeR = ANIM.kneeBendMax * speedFrac * Math.max(0, Math.cos(player.gaitPhase + Math.PI));
   } else if (player.doubleJumpFlipTimer > 0) {
     // Brief, tighter tuck right after a double jump, then relaxes back to
     // the normal airborne pose once the timer runs out.
     player.doubleJumpFlipTimer -= dt;
     targetLegL = ANIM.doubleJumpTuckAngle;
     targetLegR = ANIM.doubleJumpTuckAngle;
+    targetKneeL = ANIM.doubleJumpTuckAngle;
+    targetKneeR = ANIM.doubleJumpTuckAngle;
   } else {
-    targetLegL = ANIM.jumpPoseAngle;
-    targetLegR = ANIM.jumpPoseAngle;
+    // Which leg drives up vs trails flips between the first jump and the
+    // double jump (player.jumpPoseFlipped), so it's not the same pose every
+    // time. The raised leg also gets the continuous wiggle above.
+    const raisedLegAngle = ANIM.jumpPoseRaisedLegAngle + jumpPoseWiggle;
+    if (player.jumpPoseFlipped) {
+      targetLegL = ANIM.jumpPoseLegAngle;
+      targetLegR = raisedLegAngle;
+      targetKneeL = ANIM.jumpPoseKneeAngle;
+      targetKneeR = ANIM.jumpPoseRaisedKneeAngle;
+    } else {
+      targetLegL = raisedLegAngle;
+      targetLegR = ANIM.jumpPoseLegAngle;
+      targetKneeL = ANIM.jumpPoseRaisedKneeAngle;
+      targetKneeR = ANIM.jumpPoseKneeAngle;
+    }
   }
   const maxLegDelta = ANIM.legEaseRate * dt;
   player.legAngleL = moveToward(player.legAngleL, targetLegL, maxLegDelta);
   player.legAngleR = moveToward(player.legAngleR, targetLegR, maxLegDelta);
+  player.kneeAngleL = moveToward(player.kneeAngleL, targetKneeL, maxLegDelta);
+  player.kneeAngleR = moveToward(player.kneeAngleR, targetKneeR, maxLegDelta);
+
+  // Hip/shoulder counter-rotation: pelvis twists to bring the raised leg's
+  // hip forward (legL is at sideZ<0, so bringing it forward needs a
+  // negative pelvis yaw — see design log for the rotation-direction math);
+  // upperBody twists the opposite way in the render loop. Only while
+  // airborne, in the jump pose — no twist while grounded.
+  const hipTwistTarget = player.grounded ? 0 : (player.jumpPoseFlipped ? ANIM.bodyTwistMax : -ANIM.bodyTwistMax);
+  player.bodyTwist = moveToward(player.bodyTwist, hipTwistTarget, ANIM.bodyTwistEaseRate * dt);
 
   // Naruto-run blend: a smooth 0-1 value that only ramps toward 1 while
   // BOTH gate conditions hold (fast enough, committed far enough), and
@@ -488,8 +633,16 @@ function fixedUpdate(dt, input) {
     targetArmL = normalArmL + (ANIM.narutoArmAngle - normalArmL) * player.narutoBlendFactor;
     targetArmR = normalArmR + (ANIM.narutoArmAngle - normalArmR) * player.narutoBlendFactor;
   } else {
-    targetArmL = ANIM.armJumpPoseAngle;
-    targetArmR = ANIM.armJumpPoseAngle;
+    // Sword arm flips sides along with the raised leg (player.jumpPoseFlipped),
+    // staying opposite the raised leg, and shares its wiggle.
+    const swordArmAngle = ANIM.jumpPoseSwordArmAngle + jumpPoseWiggle;
+    if (player.jumpPoseFlipped) {
+      targetArmL = swordArmAngle;
+      targetArmR = ANIM.jumpPoseOffArmAngle;
+    } else {
+      targetArmL = ANIM.jumpPoseOffArmAngle;
+      targetArmR = swordArmAngle;
+    }
   }
   player.armAngleL = moveToward(player.armAngleL, targetArmL, maxLegDelta);
   player.armAngleR = moveToward(player.armAngleR, targetArmR, maxLegDelta);
@@ -534,11 +687,17 @@ function frame(now) {
     1 + player.bodyStretch,
     1 - player.bodyStretch * 0.5
   );
-  legL.rotation.z = player.legAngleL;
-  legR.rotation.z = player.legAngleR;
+  legL.hipPivot.rotation.z = player.legAngleL;
+  legR.hipPivot.rotation.z = player.legAngleR;
+  // Knee bend is negative (backward) relative to the thigh's own rotation —
+  // knees only bend one way, regardless of the thigh's current swing angle.
+  legL.kneePivot.rotation.z = -player.kneeAngleL;
+  legR.kneePivot.rotation.z = -player.kneeAngleR;
   armL.rotation.z = player.armAngleL;
   armR.rotation.z = player.armAngleR;
   upperBody.rotation.z = player.upperBodyLean;
+  pelvis.rotation.y = player.bodyTwist;
+  upperBody.rotation.y = -player.bodyTwist * ANIM.shoulderCounterTwistFactor;
   updateDustParticles(delta);
 
   const speed = Math.abs(player.vel.x);
