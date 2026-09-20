@@ -37,10 +37,12 @@ const STATS = {
   doubleJumpSpeed: 31.2, // was 28.7; recalculated the same way, keeping the
                           // double jump at ~128% of the first jump's height
   // Fast-fall: pressing down while already falling (not still rising)
-  // instantly snaps you to a faster terminal velocity for the rest of that
-  // fall. Ratio to Max Fall Speed (~1.15x) is toward the low end of
-  // Melee's typical range (was ~1.3x, felt too fast).
-  fastFallSpeed: 38,
+  // raises the fall-speed cap AND doubles the effective gravity for the
+  // rest of that fall, so it accelerates down noticeably faster than a
+  // normal fall — a middle ground between an instant snap (felt wrong)
+  // and reusing plain gravity (felt unimpactful).
+  fastFallSpeed: 34,
+  fastFallGravityMultiplier: 2,
   airAccel: 36,
   // Air friction: a separate, weaker deceleration that only applies when no
   // direction is held in the air (Melee has this; we were missing it
@@ -145,7 +147,12 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87ceeb);
 
-const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+const CAMERA_BASE_FOV = 50;
+const CAMERA_MAX_FOV_BOOST = 4;    // extra degrees of FOV at full ground speed
+const CAMERA_FOV_EASE_RATE = 20;   // degrees/sec
+const CAMERA_SHAKE_DECAY = 10;     // shake-amount units/sec
+
+const camera = new THREE.PerspectiveCamera(CAMERA_BASE_FOV, window.innerWidth / window.innerHeight, 0.1, 200);
 camera.position.set(0, 9, 17);
 camera.lookAt(0, 3.8, 0); // aimed higher than before, so more sky and less
                           // foreground shows — gives headroom to see jumps
@@ -357,6 +364,49 @@ function updateDustParticles(delta) {
   }
 }
 
+// --- audio (simple synthesized SFX, no external files) -----------------------
+// Browsers block audio playback until a user gesture, so the AudioContext is
+// created lazily on the first keydown rather than at page load.
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+window.addEventListener('keydown', ensureAudio, { once: true });
+
+function playBlip({ freq, freqEnd = null, duration, type = 'sine', volume = 0.15 }) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (freqEnd !== null) osc.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 1), t0 + duration);
+  gain.gain.setValueAtTime(volume, t0);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration); // quick decay avoids audible clicks
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + duration);
+}
+
+function playFootstepSound() {
+  playBlip({ freq: 130, freqEnd: 80, duration: 0.05, type: 'triangle', volume: 0.07 });
+}
+function playJumpSound() {
+  playBlip({ freq: 220, freqEnd: 520, duration: 0.12, type: 'sine', volume: 0.12 });
+}
+function playLandSound(impactSpeed) {
+  const volume = Math.min(0.28, 0.05 + impactSpeed * 0.005); // harder landing = louder thud
+  playBlip({ freq: 90, freqEnd: 45, duration: 0.12, type: 'triangle', volume });
+}
+function playTurnSound() {
+  playBlip({ freq: 650, freqEnd: 220, duration: 0.07, type: 'sawtooth', volume: 0.05 });
+}
+function playFastFallSound() {
+  playBlip({ freq: 320, freqEnd: 140, duration: 0.1, type: 'sine', volume: 0.07 });
+}
+
 // --- input --------------------------------------------------------------------
 // Digital-first input: keyboard is on/off by nature, and gamepad stick input
 // is quantized to -1/0/1 too, so both feel equivalent (controller analog
@@ -419,6 +469,8 @@ const player = {
   bodyTwist: 0, // pelvis yaw twist; upperBody twists opposite this while airborne
   sameDirDistance: 0, // resets whenever travel direction changes
   lastMoveDir: 0,
+  lastGaitStepIndex: -1, // for edge-detecting footstep sound triggers
+  cameraShakeAmount: 0,  // eases to 0; kicked up on hard landings
   narutoBlendFactor: 0, // 0-1, eases over narutoTransitionDuration either way
 };
 
@@ -455,6 +507,7 @@ function fixedUpdate(dt, input) {
   if (isReversalInput && !player.wasReversalInput &&
       Math.abs(player.vel.x) > STATS.groundMaxSpeed * ANIM.turnDustSpeedFraction) {
     spawnTurnDust(player.pos.x, player.pos.y);
+    playTurnSound();
   }
   player.wasReversalInput = isReversalInput;
 
@@ -467,14 +520,20 @@ function fixedUpdate(dt, input) {
       ? moveToward(player.vel.x, STATS.groundMaxSpeed * moveDirX, STATS.groundAccel * dt)
       : moveToward(player.vel.x, 0, STATS.groundDecel * dt);
   } else {
-    // Fast-fall: pressing down while already moving downward instantly
-    // snaps to a faster terminal velocity for the rest of this fall.
+    // Fast-fall: pressing down while already moving downward raises the
+    // fall-speed cap for the rest of this fall. Gravity (the same rate as
+    // a normal fall) accelerates you toward that higher cap over time —
+    // no instant velocity snap, so it ramps up like everything else rather
+    // than teleporting straight to max fast-fall speed.
     if (!player.fastFalling && downHeld && player.vel.y <= 0) {
       player.fastFalling = true;
-      player.vel.y = -STATS.fastFallSpeed;
+      playFastFallSound();
     }
     const fallCap = player.fastFalling ? STATS.fastFallSpeed : STATS.maxFallSpeed;
-    player.vel.y = Math.max(player.vel.y - STATS.gravity * dt, -fallCap);
+    const gravityNow = player.fastFalling ? STATS.gravity * STATS.fastFallGravityMultiplier : STATS.gravity;
+    player.vel.y = Math.max(player.vel.y - gravityNow * dt, -fallCap);
+    // Horizontal air control is entirely independent of fast-fall/downHeld —
+    // holding down-and-a-direction keeps full sideways momentum/control.
     if (dirX !== 0) {
       player.vel.x += STATS.airAccel * dirX * dt;
       player.vel.x = Math.max(-STATS.maxAirSpeed, Math.min(STATS.maxAirSpeed, player.vel.x));
@@ -488,11 +547,13 @@ function fixedUpdate(dt, input) {
     if (player.grounded) {
       doJump(STATS.jumpSpeed);
       player.jumpPoseFlipped = false; // first jump always starts in the default orientation
+      playJumpSound();
     } else if (player.hasDoubleJump) {
       player.hasDoubleJump = false;
       doJump(STATS.doubleJumpSpeed);
       player.doubleJumpFlipTimer = ANIM.doubleJumpTuckDuration;
       player.jumpPoseFlipped = true; // double jump swaps which leg/arm is active
+      playJumpSound();
     }
   }
 
@@ -500,12 +561,15 @@ function fixedUpdate(dt, input) {
   player.pos.y += player.vel.y * dt;
 
   if (!player.grounded && player.pos.y <= 0 && player.vel.y <= 0) {
+    const impactSpeed = Math.abs(player.vel.y);
     player.pos.y = 0;
     player.vel.y = 0;
     player.grounded = true;
     player.hasDoubleJump = true;
     player.fastFalling = false;
     player.bodyStretch = ANIM.landingSquashKick;
+    playLandSound(impactSpeed);
+    player.cameraShakeAmount = Math.min(0.25, impactSpeed * 0.006);
   }
 
   // Crouch: holding down while grounded sustains a squash target instead of
@@ -564,6 +628,13 @@ function fixedUpdate(dt, input) {
     player.gaitPhase += 2 * Math.PI * ANIM.gaitCyclesPerSecAtMax * speedFrac * dt;
     targetLegL = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase);
     targetLegR = ANIM.legSwingMax * speedFrac * Math.sin(player.gaitPhase + Math.PI);
+    // Footstep sound: fires once each half-cycle (roughly once per leg's
+    // plant), via the same edge-on-crossing pattern used elsewhere.
+    const gaitStepIndex = Math.floor(player.gaitPhase / Math.PI);
+    if (gaitStepIndex !== player.lastGaitStepIndex && speedFrac > 0.05) {
+      playFootstepSound();
+    }
+    player.lastGaitStepIndex = gaitStepIndex;
     // Knee bend: a half-wave-rectified cosine peaks when the hip is at
     // neutral swinging forward (cos(phase)=1, foot lifting for clearance)
     // and is clamped to zero for the half-cycle around stance/push-off
@@ -699,6 +770,18 @@ function frame(now) {
   pelvis.rotation.y = player.bodyTwist;
   upperBody.rotation.y = -player.bodyTwist * ANIM.shoulderCounterTwistFactor;
   updateDustParticles(delta);
+
+  // Camera reaction: a subtle shake that decays after hard landings, and a
+  // small FOV push that scales with ground speed for a sense of velocity.
+  player.cameraShakeAmount = Math.max(0, player.cameraShakeAmount - CAMERA_SHAKE_DECAY * delta);
+  const shakeX = (Math.random() - 0.5) * player.cameraShakeAmount;
+  const shakeY = (Math.random() - 0.5) * player.cameraShakeAmount;
+  camera.position.set(shakeX, 9 + shakeY, 17);
+  camera.lookAt(0, 3.8, 0);
+  const cameraSpeedFrac = Math.min(1, Math.abs(player.vel.x) / STATS.groundMaxSpeed);
+  const targetFov = CAMERA_BASE_FOV + CAMERA_MAX_FOV_BOOST * cameraSpeedFrac;
+  camera.fov = moveToward(camera.fov, targetFov, CAMERA_FOV_EASE_RATE * delta);
+  camera.updateProjectionMatrix();
 
   const speed = Math.abs(player.vel.x);
   hud.innerHTML =
